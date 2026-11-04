@@ -6,3 +6,5 @@ build/
 .venv/
 report.txt
 inflated/
+
+/cache/
