@@ -87,10 +87,12 @@ def coarse_flow(state, index):
     return limit*np.tanh(flow/limit)
 
 def predict(previous, state, index):
-    if not state["arrays"]:
+    if not state["arrays"] or ("strengths" in state["arrays"] and state["arrays"]["strengths"][index] == 0):
         return previous.copy()
     height, width = previous.shape
     flow = resize_bilinear(coarse_flow(state, index), height, width)
+    if "strengths" in state["arrays"]:
+        flow *= float(state["arrays"]["strengths"][index])/16
     # Actual deployed codec uses deterministic integer nearest-neighbor warps.
     dx, dy = np.rint(flow).astype(np.int32)
     yy, xx = np.indices((height,width))
@@ -273,6 +275,8 @@ def preview(tokens,state,path):
         error = prediction != tokens[t]
         coarse = coarse_flow(state,t-1) if state["arrays"] else np.zeros((2,2,2))
         flow = resize_bilinear(coarse,h,w)
+        if "strengths" in state["arrays"]:
+            flow *= float(state["arrays"]["strengths"][t-1])/16
         magnitude = np.sqrt((flow*flow).sum(0))/max(state["max_flow"],1)
         angle = (np.arctan2(flow[1],flow[0])+np.pi)/(2*np.pi)
         hsv = np.stack([angle*255,np.full_like(angle,220),np.clip(magnitude*4,0,1)*255],-1).astype(np.uint8)
@@ -321,6 +325,75 @@ def benchmark(args):
     lines.extend(["",f"Published #151 token stream: {args.reference_token_bytes:,} bytes. Its HPAC model is shared with its renderer/container and is not included in that stream-only count; this prototype charges its own motion model. Integration and full archive accounting are required for a leaderboard comparison.","", "GIFs show selected frame transitions across the sequence, not continuous real-time playback."])
     (args.output / "summary.md").write_text("\n".join(lines)+"\n")
 
+def refine(args):
+    """Select quantized per-frame motion strengths by actual hard-token error.
+
+    The selector is transmitted inside motion.bin; decoder never consults the
+    originals. This optimizes mismatch count, not Brotli compressed size.
+    """
+    tokens = read_tokens(args.tokens)
+    state = unpack_state(args.model.read_bytes())
+    if tuple(state["shape"]) != tokens.shape or not state["arrays"] or "strengths" in state["arrays"]:
+        raise ValueError("expected an unrefined learned model with matching dimensions")
+    if args.output.exists():
+        raise ValueError("output exists; preserving previous work")
+    n,h,w = tokens.shape
+    yy,xx = np.indices((h,w))
+    choices = (0,4,8,12,16,24,32)
+    strengths = np.zeros(n-1,dtype="<i2")
+    records = []
+    identity_total, original_total, selected_total = 0,0,0
+    start = time.monotonic()
+    for index in range(n-1):
+        previous, current = np.asarray(tokens[index]), np.asarray(tokens[index+1])
+        flow = resize_bilinear(coarse_flow(state,index),h,w)
+        identity_error = int(np.count_nonzero(previous != current))
+        best_error, best_strength = identity_error, 0
+        original_error = None
+        for strength in choices[1:]:
+            dx,dy = np.rint(flow*(strength/16)).astype(np.int32)
+            prediction = previous[np.clip(yy+dy,0,h-1),np.clip(xx+dx,0,w-1)]
+            error = int(np.count_nonzero(prediction != current))
+            if strength == 16:
+                original_error = error
+            if error < best_error:
+                best_error, best_strength = error, strength
+        assert best_error <= identity_error
+        strengths[index] = best_strength
+        identity_total += identity_error
+        original_total += original_error
+        selected_total += best_error
+        records.append(dict(transition=index,strength=best_strength/16,identity_errors=identity_error,
+                            original_errors=original_error,selected_errors=best_error))
+        if (index+1)%100 == 0:
+            print(f"Hard-warp audit {index+1}/{n-1}: {time.monotonic()-start:.1f}s",flush=True)
+    state["arrays"]["strengths"] = strengths
+    transmitted = pack_state(state)
+    deployed = unpack_state(transmitted)
+    # Verify chosen predictions after transmission, including the zero-motion
+    # shortcut. File-level independent exact decoding follows in benchmark.
+    for record in records:
+        index = record["transition"]
+        recovered_error = int(np.count_nonzero(predict(np.asarray(tokens[index]),deployed,index) != tokens[index+1]))
+        if recovered_error != record["selected_errors"]:
+            raise ValueError("transmitted strength changed prediction")
+    denominator = (n-1)*h*w
+    result = dict(shape=list(tokens.shape),identity_prediction_error=identity_total/denominator,
+                  original_prediction_error=original_total/denominator,
+                  refined_prediction_error=selected_total/denominator,
+                  improved_transitions=sum(r["selected_errors"] < r["identity_errors"] for r in records),
+                  total_transitions=n-1,identity_selected=int(np.count_nonzero(strengths == 0)),
+                  strength_counts={str(s/16):int(np.count_nonzero(strengths == s)) for s in choices},
+                  original_model_bytes=args.model.stat().st_size,refined_model_bytes=len(transmitted),
+                  elapsed_seconds=time.monotonic()-start,
+                  objective="full-sequence hard token mismatch; compression measured separately",
+                  parameters_charged=True)
+    args.output.mkdir(parents=True)
+    (args.output/"motion.bin").write_bytes(transmitted)
+    (args.output/"audit.json").write_text(json.dumps(result,indent=2)+"\n")
+    (args.output/"per_transition.json").write_text(json.dumps(records,indent=2)+"\n")
+    print(json.dumps(result,indent=2),flush=True)
+
 def smoke():
     import tempfile
     import torch
@@ -351,6 +424,12 @@ def smoke():
             encode(tokens,state,path,quality=1)
             result,_ = decode(path)
             np.testing.assert_array_equal(result,tokens)
+            state["arrays"]["strengths"] = np.array([0,4,8,16,24,32],dtype="<i2")
+            path = directory / f"rank{rank}_gated.smc"
+            encode(tokens,state,path,quality=1)
+            result,_ = decode(path)
+            np.testing.assert_array_equal(result,tokens)
+            np.testing.assert_array_equal(predict(tokens[0],state,0),tokens[0])
         path = directory / "identity.smc"
         encode(tokens,identity_state(tokens.shape),path,quality=1)
         result,_ = decode(path)
@@ -371,6 +450,10 @@ def main():
     de = sub.add_parser("decode")
     de.add_argument("--archive",type=Path,required=True)
     de.add_argument("--output",type=Path,required=True)
+    re = sub.add_parser("refine")
+    re.add_argument("--tokens",type=Path,required=True)
+    re.add_argument("--model",type=Path,required=True)
+    re.add_argument("--output",type=Path,required=True)
     tr = sub.add_parser("train")
     tr.add_argument("--tokens",type=Path,required=True)
     tr.add_argument("--output",type=Path,required=True)
@@ -405,6 +488,8 @@ def main():
         args.output.parent.mkdir(parents=True,exist_ok=True)
         np.save(args.output,recovered,allow_pickle=False)
         print(json.dumps(dict(shape=list(recovered.shape),tokens_sha256=sha(recovered.tobytes()),verified=True)))
+    elif args.command == "refine":
+        refine(args)
     elif args.command == "train":
         if args.rank < 0 or min(args.grid_h,args.grid_w) < 2 or args.max_flow <= 0 or min(args.steps,args.batch,args.save_every,args.log_every,args.threads) < 1:
             ap.error("invalid training dimensions or schedule")
