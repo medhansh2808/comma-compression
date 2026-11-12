@@ -74,11 +74,13 @@ decode it, capture rate-saving alternative labels at their native coding
 probabilities, and render the baseline. Only alternatives saving more than
 0.25 estimated bits are considered; retain up to 512 per frame.
 
-Differentiate through the token embedding, renderer, RGB rounding using STE,
+The exact edit renderer and metrics use the decoder's batch of eight.
+Differentiate through the token embedding, singleton renderer and RGB rounding using STE,
 SegNet and PoseNet to rank proposals. The segmentation surrogate is a sigmoid
 of the wrong-vs-target logit margin. The pose term uses the derivative of the
-full-video square-root score at the baseline distortion. Check renderer pixels
-and differentiable metric preprocessing against the actual baseline path.
+full-video square-root score at the baseline distortion. The singleton gradient is an approximate proposal derivative with forward
+pixels anchored to verified batched decoder output. Check batched renderer
+pixels and differentiable metric preprocessing against the actual baseline path.
 
 For up to 12 proposals per frame, render each individual edited token map and
 evaluate exact label disagreements and pose error. Rank using that measured
@@ -97,7 +99,8 @@ baseline and report that result.
 
 The launcher prints the new run directory. Logs are hpac.log and token_rdo.log.
 Each stage writes best.json, summary.json, per-candidate results and a runtime
-snapshot. HPAC keeps epoch models and last.pt; there is no automatic resume.
+snapshot. HPAC keeps epoch models and last.pt; HPAC has no automatic resume.
+Token editing now supports --resume: see FIX_AND_RESUME.md.
 Use a new run directory for a new attempt rather than deleting an existing run.
 
 Detach tmux using Ctrl+B, release, D. Ctrl+C interrupts the job.

@@ -55,7 +55,18 @@ def resolve_archive(args):
 def session(args):
     archive = resolve_archive(args)
     out = args.output.expanduser().resolve()
-    if out.exists():
+    resume = getattr(args, 'resume', False)
+    previous = None
+    if resume:
+        previous = json.loads((out/'manifest.json').read_text())
+        if previous['archive_sha256'] != sha(archive):
+            raise ValueError('Resume archive differs from the original run')
+        private = out/'runtime'
+        for name, digest in previous['source_sha256'].items():
+            if '__pycache__' not in name and not name.endswith('.pyc'):
+                if sha(private/name) != digest:
+                    raise ValueError(f'Resume runtime source changed: {name}')
+    elif out.exists():
         raise FileExistsError(f'Preserving existing run: {out}; choose another --output')
     for p in (archive, EXP/'train_entropy.py', EXP/'profile_reference.py',
               EXP/'cache/tokens151_o2.npy', EXP/'work/rd/gt_dali.npz'):
@@ -64,11 +75,11 @@ def session(args):
     source = (args.runtime_source or EXP/'work/reference').expanduser().resolve()
     if not source.is_dir():
         raise FileNotFoundError(source)
-    out.mkdir(parents=True)
+    out.mkdir(parents=True, exist_ok=resume)
     private = out / 'runtime'
     # Snapshot executable sources only, not old experiment data or shared objects.
     allowed = {'.py', '.c', '.cpp', '.h', '.sh'}
-    for p in source.rglob('*'):
+    for p in ([] if resume else source.rglob('*')):
         if not p.is_file() or p.suffix not in allowed or '__pycache__' in p.parts:
             continue
         target = private / p.relative_to(source)
@@ -76,10 +87,12 @@ def session(args):
         shutil.copy2(p, target)
     rt = private/'external/pr141'
     libs = out/'native'
-    libs.mkdir()
+    libs.mkdir(exist_ok=resume)
     compiler = os.environ.get('CC', 'cc')
     for name, src in [('rc64',rt/'runtime/entropy/rc64_encode_backend.c'),
                       ('corrector',rt/'runtime/f26_corrector_native.c')]:
+        if resume and (libs/f'{name}.so').is_file():
+            continue
         subprocess.run([compiler, '-O2', '-std=c11', '-shared', '-fPIC',
                         '-ffp-contract=off', '-fno-fast-math', str(src),
                         '-o', str(libs/f'{name}.so'), '-lm'], check=True)
@@ -98,6 +111,8 @@ def session(args):
     from decoder.numerics import official_flags
     official_flags()
     gt_path = EXP/'work/rd/gt_dali.npz'
+    if previous is not None and previous['gt_sha256'] != sha(gt_path):
+        raise ValueError('Resume ground truth differs')
     with np.load(gt_path) as gt:
         gp, gs = gt['pose'].copy(), gt['seg'].copy()
     if gp.shape != (600,6) or gs.shape != (600,384,512):
@@ -114,15 +129,33 @@ def session(args):
                     source_sha256={str(p.relative_to(private)):sha(p)
                                    for p in private.rglob('*') if p.is_file()},
                     torch_version=torch.__version__, cuda_device=torch.cuda.get_device_name(0))
-    write_json(out/'manifest.json', manifest)
+    if previous is not None:
+        if previous['torch_version'] != torch.__version__:
+            raise ValueError('Resume PyTorch version differs')
+        write_json(out/f'resume_manifest_{time.time_ns()}.json', manifest)
+    else:
+        write_json(out/'manifest.json', manifest)
     return dict(out=out, archive=archive, base=base, ref=ref, private=private,
-                rt=rt, torch=torch, common=common, net=metrics_net, gp=gp, gs=gs)
+                rt=rt, torch=torch, common=common, net=metrics_net, gp=gp, gs=gs,
+                resume=resume)
 
 
-def evaluate(s, archive, folder, *, expected_tokens=None, keep_raw=False):
+def evaluate(s, archive, folder, *, expected_tokens=None, keep_raw=False, force=False):
     """Actual archive -> real token decode -> rendered RGB -> both metrics."""
     folder.mkdir(parents=True, exist_ok=True)
     raw = folder/'frames.raw'
+    result_file=folder/'evaluation.json'
+    if s.get('resume') and result_file.exists() and not force:
+        cached=json.loads(result_file.read_text())
+        if cached['archive_sha256'] != sha(archive):
+            raise ValueError('Cached evaluation archive changed')
+        if expected_tokens is not None and cached['token_sha256'] != expected_tokens:
+            raise ValueError('Cached evaluation token hash differs')
+        if not keep_raw or (raw.is_file() and raw.stat().st_size==int(np.prod(RAW_SHAPE))):
+            if not keep_raw:
+                raw.unlink(missing_ok=True)
+            log(phase='reuse_evaluation',archive=str(archive),score=cached['score'])
+            return cached,raw
     if shutil.disk_usage(folder).free < np.prod(RAW_SHAPE)+1024**3:
         raise RuntimeError('Need space for one 3.67 GB RGB evaluation file')
     from decoder import inflate_core
@@ -153,6 +186,16 @@ def select(s, result):
 def encode(s, input_archive, tokens, folder):
     """Replace only the token stream; accept full native stream after decode."""
     folder.mkdir(parents=True,exist_ok=True)
+    token_sha=hashlib.sha256(tokens.tobytes()).hexdigest()
+    cached_file=folder/'encoding.json'
+    if s.get('resume') and cached_file.exists():
+        cached=json.loads(cached_file.read_text())
+        if (cached.get('tokens_sha256')==token_sha and
+            cached.get('input_archive_sha256')==sha(input_archive) and
+            sha(folder/'archive.zip')==cached['archive_sha256']):
+            log(phase='reuse_encoding',archive=str(folder/'archive.zip'))
+            return folder/'archive.zip'
+        raise ValueError('Completed encode has incompatible provenance')
     from container import token_encode, token_decode
     from container.payload_format import read_archive,split_inner_payload,write_archive
     from container.archive_writer import EXTERNAL_ATTR_PR141
@@ -170,6 +213,7 @@ def encode(s, input_archive, tokens, folder):
     if not np.array_equal(decoded.numpy(),tokens):
         raise ValueError('Native token round trip failed')
     result = dict(archive=str(dest),archive_sha256=sha(dest),bytes=dest.stat().st_size,
+                  tokens_sha256=token_sha,input_archive_sha256=sha(input_archive),
                   token_stream_bytes=len(stream),roundtrip_verified=True,
                   seconds=time.monotonic()-started)
     write_json(folder/'encoding.json',result)
